@@ -1571,7 +1571,8 @@ add_gpus([
 add_gpus([
         GPUId(chip_id=0xffff44050000, name="Adreno (TM) 830"),
         GPUId(chip_id=0xffff44050001, name="Adreno (TM) 830v1"),
-        GPUId(chip_id=0x44050001, name="Adreno (TM) 830"), # KGSL
+        GPUId(chip_id=0x44050000, name="Adreno (TM) 830"), # KGSL
+        GPUId(chip_id=0x44050001, name="Adreno (TM) 830"), # KGSL 0001
     ], A6xxGPUInfo(
         CHIP.A8XX,
         [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1],

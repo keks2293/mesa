@@ -56,7 +56,8 @@ get_ubo_info(nir_intrinsic_instr *instr, struct ir3_ubo_info *ubo)
       return true;
    } else {
       nir_intrinsic_instr *rsrc = ir3_bindless_resource(instr->src[0]);
-      if (rsrc && nir_src_is_const(rsrc->src[0])) {
+      if (rsrc && nir_src_is_const(rsrc->src[0]) &&
+          nir_src_is_const(instr->src[1])) {
          ubo->global_base = NULL;
          ubo->block = nir_src_as_uint(rsrc->src[0]);
          ubo->bindless_base = nir_intrinsic_desc_set(rsrc);
