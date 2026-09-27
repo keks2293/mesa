@@ -130,13 +130,6 @@ tu_is_r8g8(enum pipe_format format)
           (util_format_get_nr_components(format) == 2);
 }
 
-static bool
-tu_is_r8g8_compatible(enum pipe_format format)
-{
-   return (util_format_get_blocksize(format) == 2) &&
-          !util_format_is_depth_or_stencil(format);
-}
-
 uint64_t
 tu_layer_address(const struct fdl6_view *iview, uint32_t layer)
 {
@@ -430,55 +423,6 @@ ubwc_possible(struct tu_device *device,
    return true;
 }
 
-/* R8G8 have a different block width/height and height alignment from other
- * formats that would normally be compatible (like R16), and so if we are
- * trying to, for example, sample R16 as R8G8 we need to demote to linear.
- */
-static bool
-format_list_reinterprets_r8g8_r16(enum pipe_format format, const VkImageFormatListCreateInfo *fmt_list)
-{
-   /* Check if it's actually a 2-cpp color format. */
-   if (!tu_is_r8g8_compatible(format))
-      return false;
-
-   /* If there's no format list, then the app may reinterpret to any compatible
-    * format.
-    */
-   if (!fmt_list || !fmt_list->viewFormatCount)
-      return true;
-
-   bool has_r8g8 = false;
-   bool has_non_r8g8 = false;
-   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
-      enum pipe_format format =
-         vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
-      if (tu_is_r8g8(format))
-         has_r8g8 = true;
-      else
-         has_non_r8g8 = true;
-   }
-   return has_r8g8 && has_non_r8g8;
-}
-
-static bool
-format_list_has_swaps(const VkImageFormatListCreateInfo *fmt_list)
-{
-   /* If there's no format list, then the app may reinterpret to any compatible
-    * format, and presumably one would have the swap set.
-    */
-   if (!fmt_list || !fmt_list->viewFormatCount)
-      return true;
-
-   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
-      enum pipe_format format =
-         vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
-
-      if (tu6_format_texture(format, TILE6_LINEAR, false).swap)
-         return true;
-   }
-   return false;
-}
-
 static bool
 format_list_has_uncompressed_format(
    const VkImageFormatListCreateInfo *fmt_list)
@@ -648,8 +592,8 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
                ubwc_enabled = false;
             }
 
-            bool r8g8_r16 = format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
-            bool fmt_list_has_swaps = format_list_has_swaps(fmt_list);
+            bool r8g8_r16 = tu6_format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
+            bool fmt_list_has_swaps = tu6_format_list_has_swaps(fmt_list);
 
             if (r8g8_r16 || fmt_list_has_swaps) {
                ubwc_enabled = false;
@@ -734,11 +678,16 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       tile_mode = TILE6_LINEAR;
    }
 
-   /* We cannot support sparse residency with linear images, it should've been
-    * rejected.
+   /* We cannot support sparse residency with linear images.  The sparse
+    * bookkeeping addresses the tiled layout, so a linear image created with
+    * SPARSE_RESIDENCY silently reads and writes the wrong places instead of
+    * failing, and the format query cannot see the format list which demoted
+    * us to linear.  Refuse the create.
     */
-   assert(!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) ||
-          tile_mode == TILE6_3);
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
+      if (tile_mode != TILE6_3)
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
 
    for (uint32_t i = 0; i < tu6_plane_count(image->vk.format); i++) {
       struct fdl_layout *layout = &image->layout[i];
