@@ -40,6 +40,28 @@ tu_CreateIndirectCommandsLayoutEXT(VkDevice _device,
    if (!layout)
       return vk_error(_device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* M2.2: v1 scope — push constants + draw/dispatch (+ count/index/vertex
+    * buffers, sequence index). Execution sets (shader objects), mesh and
+    * ray-tracing tokens are rejected loudly.
+    */
+   const uint32_t v1_dgc_info =
+      BITFIELD_BIT(MESA_VK_DGC_PC) |
+      BITFIELD_BIT(MESA_VK_DGC_SI) |
+      BITFIELD_BIT(MESA_VK_DGC_IB) |
+      BITFIELD_BIT(MESA_VK_DGC_VB) |
+      BITFIELD_BIT(MESA_VK_DGC_DRAW) |
+      BITFIELD_BIT(MESA_VK_DGC_DRAW_INDEXED) |
+      BITFIELD_BIT(MESA_VK_DGC_DISPATCH);
+   if ((layout->vk.dgc_info & ~v1_dgc_info) != 0) {
+      const VkResult err = vk_errorf(
+         _device, VK_ERROR_FEATURE_NOT_PRESENT,
+         "DGC layout uses tokens outside the turnip v1 scope (dgc_info=0x%x, "
+         "v1=0x%x: execution sets/mesh/RT not supported yet)",
+         layout->vk.dgc_info, v1_dgc_info);
+      vk_indirect_command_layout_destroy(&device->vk, pAllocator, &layout->vk);
+      return err;
+   }
+
    *pIndirectCommandsLayout = tu_indirect_command_layout_to_handle(layout);
    return VK_SUCCESS;
 }
