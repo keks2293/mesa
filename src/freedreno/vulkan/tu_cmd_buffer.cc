@@ -26,10 +26,14 @@
 #include "tu_knl.h"
 #include "tu_perfetto.h"
 #include "tu_scratch_ram.h"
+#include "tu_shader.h"
 #include "tu_subsampled_image.h"
 #include "tu_tile_config.h"
 #include "tu_tracepoints.h"
 #include "tu_trace_bin_layout.h"
+#include "nir/nir_builder.h"
+#include "ir3/ir3_nir.h"
+#include "ir3/ir3_shader.h"
 
 enum tu_cmd_buffer_status {
    TU_CMD_BUFFER_STATUS_IDLE = 0,
@@ -7914,8 +7918,15 @@ tu7_emit_shared_preamble_consts(
    const struct tu_push_constant_range *shared_consts,
    uint32_t *push_constants)
 {
-   tu_cs_emit_pkt4(cs, SP_SHARED_CONSTANT_GFX_REG(CHIP, shared_consts->lo_dwords).reg,
-                   shared_consts->dwords);
+   unsigned reg = SP_SHARED_CONSTANT_GFX_REG(CHIP, shared_consts->lo_dwords).reg;
+   if (getenv("DGC_DUMP")) {
+      fprintf(stderr, "preamble_emit: reg=%#x lo=%u n=%u vals=", reg,
+              shared_consts->lo_dwords, shared_consts->dwords);
+      for (unsigned i = 0; i < shared_consts->dwords; i++)
+         fprintf(stderr, "%08x ", push_constants[shared_consts->lo_dwords + i]);
+      fprintf(stderr, "\n");
+   }
+   tu_cs_emit_pkt4(cs, reg, shared_consts->dwords);
    tu_cs_emit_array(cs, push_constants + shared_consts->lo_dwords,
                     shared_consts->dwords);
 }
@@ -10035,6 +10046,289 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
    }
 
    cmd->state.total_dispatches++;
+}
+
+/* ---------------- DGC M2.0 spike: внутренний probe-шейдер ----------------
+ *
+ * Цель спайка (GO/NO-GO по плану M2.0): внутренний compute-шейдер,
+ * скомпилированный в драйвере, пишет в память PM4-payload (4 dword'а =
+ * CP_MEM_WRITE), затем CP исполняет этот payload через CP_INDIRECT_BUFFER.
+ * Критерий GO: запись шейдера видна после исполнения IB (маркер на CPU).
+ *
+ * Канал параметров — push constants (как у RADV radv_dgc.c:831):
+ *   [0..1] dst VA (куда шейдер пишет payload = адрес аргумент-буфера),
+ *   [2]    dword0 payload'а (заголовок CP_MEM_WRITE, считается на CPU),
+ *   [3..4] VA маркер-буфера (адрес для CP_MEM_WRITE из payload'а),
+ *   [5]    значение-маркер.
+ */
+
+/* Фиктивный layout "только push constants" — используется лишь для
+ * const_state (tu_lower_io/tu_shader_create читают push_constant_size);
+ * дескриптор-сетов нет (num_sets = 0). Статика = живёт вечно. */
+static struct tu_pipeline_layout dgc_probe_layout;
+
+static VkResult
+tu_dgc_probe_create_shader(struct tu_device *dev)
+{
+   nir_builder _b =
+      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "dgc probe cs");
+   nir_builder *b = &_b;
+
+   _b.shader->options = ir3_get_compiler_options(dev->compiler);
+   _b.shader->info.workgroup_size[0] = 64;
+
+   /* dst VA */
+   nir_def *va32 = nir_load_push_constant(b, 2, 32, nir_imm_int(b, 0),
+                                          .base = 0, .range = 8);
+   nir_def *va = nir_pack_64_2x32(b, va32);
+
+   /* payload: 4 dword'а (CP_MEM_WRITE packet).
+    *
+    * Единицы static .base в tu-лоуэре: dword'ы (base -= lo_dwords,
+    * base += offset_vec4*4), а байтовое смещение dynamic-части идёт в src
+    * и делится на 4 внутри lower_load_push_constant (ushr src, 2) — ровно
+    * так его и порождает nir_lower_explicit_io из SPIRV (там .base=0,
+    * байты в src). .base=8 (в байтах) читал бы dword 8 (c2.x) вместо
+    * dword 2 — мимо скопированного STSC-диапазона. */
+   nir_def *payload = nir_load_push_constant(b, 4, 32, nir_imm_int(b, 8),
+                                             .base = 0, .range = 24);
+
+   /* Только первый поток пишет (64 одинаковых store'ов в один адрес —
+    * гонка без пользы). */
+   nir_def *id = nir_load_local_invocation_index(b);
+   struct nir_if *nif = nir_push_if(b, nir_ieq_imm(b, id, 0));
+   nir_store_global(b, payload, va, .access = ACCESS_NON_READABLE,
+                    .align_mul = 4);
+   nir_pop_if(b, nif);
+
+   struct tu_shader_key key = {};
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   tu_lower_nir(dev, _b.shader, &key, &ir3_key, &info);
+
+   dgc_probe_layout.push_constant_size = 32;
+
+   struct tu_shader *shader = NULL;
+   VkResult result =
+      tu_shader_create(dev, &shader, _b.shader, &key, &info, &ir3_key,
+                       "dgc-probe-cs", 13, &dgc_probe_layout, false);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (getenv("DGC_DUMP")) {
+      const struct tu_push_constant_range *pc = &shader->const_state.push_consts;
+      const struct ir3_const_state *ics = shader->variant->const_state;
+      fprintf(stderr,
+              "probe_shader: push_consts type=%d lo=%u dwords=%u "
+              "allocs.push.offset_vec4=%u constlen=%u shared_base_off=%u\n",
+              (int)pc->type, pc->lo_dwords, pc->dwords,
+              ics->allocs.consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4,
+              shader->variant->constlen,
+              dev->compiler->shared_consts_base_offset);
+   }
+
+   dev->dgc_probe_shader = shader;
+   return VK_SUCCESS;
+}
+
+/* R1a: копирует payload[3] (значение из MEM_WRITE) в marker[1]. Читает
+ * память ПОСЛЕ барьера первого dispatch'а — если marker[1] получит значение,
+ * память после барьера обновлена и видна SP, а значит stale видит именно
+ * CP/PFE-путь чтения IB. */
+static VkResult
+tu_dgc_probe_create_verify_shader(struct tu_device *dev)
+{
+   nir_builder _b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+                                                   "dgc probe verify cs");
+   nir_builder *b = &_b;
+
+   _b.shader->options = ir3_get_compiler_options(dev->compiler);
+   _b.shader->info.workgroup_size[0] = 64;
+
+   nir_def *src32 = nir_load_push_constant(b, 2, 32, nir_imm_int(b, 0),
+                                           .base = 0, .range = 8);
+   nir_def *dst32 = nir_load_push_constant(b, 2, 32, nir_imm_int(b, 8),
+                                           .base = 0, .range = 16);
+   nir_def *src = nir_pack_64_2x32(b, src32);
+   nir_def *dst = nir_pack_64_2x32(b, dst32);
+
+   nir_def *id = nir_load_local_invocation_index(b);
+   struct nir_if *nif = nir_push_if(b, nir_ieq_imm(b, id, 0));
+   nir_def *val = nir_load_global(b, 1, 32, src, .align_mul = 4);
+   nir_store_global(b, val, dst, .access = ACCESS_NON_READABLE,
+                    .align_mul = 4);
+   nir_pop_if(b, nif);
+
+   struct tu_shader_key key = {};
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   tu_lower_nir(dev, _b.shader, &key, &ir3_key, &info);
+
+   struct tu_shader *shader = NULL;
+   VkResult result =
+      tu_shader_create(dev, &shader, _b.shader, &key, &info, &ir3_key,
+                       "dgc-probe-verify-cs", 20, &dgc_probe_layout, false);
+   if (result != VK_SUCCESS)
+      return result;
+
+   dev->dgc_probe_verify_shader = shader;
+   return VK_SUCCESS;
+}
+
+template <chip CHIP>
+static void
+dgc_probe_dispatch(struct tu_cmd_buffer *cmd, struct tu_buffer *buf,
+                   VkDeviceSize offset, struct tu_buffer *marker_buf,
+                   VkDeviceSize marker_offset, uint32_t value)
+{
+   struct tu_device *dev = cmd->device;
+
+   if ((offset | marker_offset) & 3)
+      return;
+
+   /* Ленивая инициализация: однопоточный стенд, без гонок. */
+   if (!dev->dgc_probe_shader &&
+       tu_dgc_probe_create_shader(dev) != VK_SUCCESS)
+      return;
+
+   struct tu_shader *shader = dev->dgc_probe_shader;
+   uint64_t dst_va = buf->bo->iova + offset;
+   uint64_t marker_va = marker_buf->bo->iova + marker_offset;
+
+   /* push constants (см. комментарий выше) */
+   memset(cmd->push_constants, 0, 8 * sizeof(uint32_t));
+   cmd->push_constants[0] = (uint32_t)dst_va;
+   cmd->push_constants[1] = (uint32_t)(dst_va >> 32);
+   cmd->push_constants[2] = pm4_pkt7_hdr(CP_MEM_WRITE, 3);
+   cmd->push_constants[3] = (uint32_t)marker_va;
+   cmd->push_constants[4] = (uint32_t)(marker_va >> 32);
+   cmd->push_constants[5] = value;
+
+   /* Бинд probe-шейдера вместо pipeline (как tu_CmdBindPipeline). В
+    * реальном DGC здесь потребуется save/restore состояния — спайк его не
+    * делает (тест не диспатчит больше ничего). */
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = shader;
+   tu_cs_emit_state_ib(&cmd->cs, shader->state);
+   cmd->state.compute_load_state = (struct tu_draw_state){};
+   cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   struct tu_dispatch_info dispatch_info = {
+      .blocks = {1, 1, 1},
+   };
+   TU_CALLX(dev, tu_dispatch)(cmd, &dispatch_info);
+
+   /* Барьер R1/M2.0: завершение CS + вывод payload'а в память, чтобы CP
+    * увидел его до CP_INDIRECT_BUFFER. (Первоначальный вывод R1 — «нужен
+    * явный WFI до flush» — A/B-перебором опровергнут: без pre-WFI стабильно
+    * PASS, а сам бит дорожает на +1..5 µs.)
+    *
+    * Барьер подобран как минимальный корректный набор (probe2 BENCH=N,
+    * M=1000, 3 прогона; µs/dispatch):
+    *
+    *   конфиг                                      корректность   µs
+    *   -----------------------------------------------------------------
+    *   без барьера (пол)                           STALE, FAIL    2.2..4.3
+    *   CLEAN | WAIT_FOR_IDLE | WAIT_FOR_ME         PASS          4.1..8.4
+    *   то же + явный pre-WFI                       PASS          9.3..9.4
+    *   плюс CACHE_INVALIDATE + WAIT_MEM_WRITES     PASS          9.8..10.2
+    *   старый NOP-пад 16384 dwords, без WFM        PASS        596..835
+    *
+    * Вывода два, оба про очередность, а не про тайминг:
+    *  - CACHE_CLEAN обязателен (CLEAN-а нет → CP читает память и видит
+    *    старое, тесты L/N);
+    *  - WAIT_FOR_IDLE обязан идти ПОСЛЕ CLEAN: CP_WAIT_FOR_ME ждёт лишь
+    *    опустошения FIFO PFP→ME, то есть приёмки пакета CLEAN самим PFP,
+    *    а не завершения чистки данными; без post-WFI чистка «признана»
+    *    раньше, чем данные долетели (тесты D/G/E — FAIL).
+    *
+    * NOP-пад оставлен только как A/B-ножка (DGC_PAD_N): он тайминг-хак
+    * (порог плавал 128 FAIL / 144 PASS / 152 FAIL) и, как показал замер,
+    * дорог — 60-150x. */
+   if (getenv("DGC_PRE_WFI"))
+      tu_cs_emit_wfi(&cmd->cs);
+
+   unsigned flush = TU_CMD_FLAG_CACHE_CLEAN |
+                    TU_CMD_FLAG_WAIT_FOR_IDLE |
+                    TU_CMD_FLAG_WAIT_FOR_ME;
+   const char *fl_env = getenv("DGC_FL");
+   if (fl_env)
+      flush = (unsigned)strtoul(fl_env, NULL, 0);
+   const char *no_wfm = getenv("DGC_NO_WFM");
+   if (no_wfm && atoi(no_wfm))
+      flush &= ~TU_CMD_FLAG_WAIT_FOR_ME;
+
+   cmd->state.cache.flush_bits |= flush;
+   tu_emit_cache_flush<CHIP>(cmd);
+
+   /* R1b: дистанция барьер → IB. Если CP_INDIRECT_BUFFER на A7XX — это
+    * PFE-вариант (prefetch engine), содержимое IB-цели подтягивается при
+    * ВЫБОРКЕ пакета из потока, а не при исполнении — глубина выборки в
+    * десятки кБ перекрывает наш 8-dword барьер, и PFE читает память ДО
+    * CACHE_CLEAN. NOP-пад сдвигает выборку IB-пакета за исполнение
+    * барьера, но это тайминг-хак (порог плавает: 128 dwords FAIL /
+    * 144 PASS / 152 FAIL), поэтому дефолт — 0, а корректность держит
+    * CP_WAIT_FOR_ME. DGC_PAD_N оставлен для A/B-замеров. */
+   {
+      int pad = 0;
+      const char *env = getenv("DGC_PAD_N");
+      if (env)
+         pad = atoi(env);
+      for (int i = 0; i < pad; i++)
+         tu_cs_emit_pkt7(&cmd->cs, CP_NOP, 0);
+   }
+
+   /* CP_INDIRECT_BUFFER на payload (4 dword'а, буфер заранее заполнен
+    * CP_NOP — при устаревшем чтении NOP'ы безвредны, маркер останется 0). */
+   struct tu_cs_entry entry = {
+      .bo = buf->bo,
+      .size = 4 * sizeof(uint32_t),
+      .offset = (uint32_t)offset,
+   };
+   tu_cs_emit_ib(&cmd->cs, &entry);
+
+   /* R1a: verify-dispatch. push: [0..1]=payload VA, [2..3]=marker+4 VA.
+    * Пишет marker[1] — CP-IB пишет marker[0]; каналы независимы. */
+   if (!dev->dgc_probe_verify_shader &&
+       tu_dgc_probe_create_verify_shader(dev) != VK_SUCCESS)
+      return;
+
+   uint64_t src_va = dst_va;           /* payload */
+   uint64_t dst_va2 = marker_va + 4;   /* marker[1] */
+
+   memset(cmd->push_constants, 0, 8 * sizeof(uint32_t));
+   cmd->push_constants[0] = (uint32_t)src_va;
+   cmd->push_constants[1] = (uint32_t)(src_va >> 32);
+   cmd->push_constants[2] = (uint32_t)dst_va2;
+   cmd->push_constants[3] = (uint32_t)(dst_va2 >> 32);
+
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = dev->dgc_probe_verify_shader;
+   tu_cs_emit_state_ib(&cmd->cs, dev->dgc_probe_verify_shader->state);
+   cmd->state.compute_load_state = (struct tu_draw_state){};
+   cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   struct tu_dispatch_info verify_info = {
+      .blocks = {1, 1, 1},
+   };
+   TU_CALLX(dev, tu_dispatch)(cmd, &verify_info);
+
+   /* Spike-диагностика: дамп всего cmd->cs. */
+   if (getenv("DGC_DUMP")) {
+      unsigned n = (unsigned)(cmd->cs.cur - cmd->cs.start);
+      fprintf(stderr, "dgc_probe: shader=%p state.size=%u cs=%u dwords\n",
+              (void *)dev->dgc_probe_shader,
+              dev->dgc_probe_shader ? dev->dgc_probe_shader->state.size : 0, n);
+      for (unsigned i = 0; i < n && i < 600; i++)
+         fprintf(stderr, "%04x: %08x\n", i, cmd->cs.start[i]);
+   }
+}
+
+void
+tu_dgc_probe_dispatch(struct tu_cmd_buffer *cmd, struct tu_buffer *buf,
+                      VkDeviceSize offset, struct tu_buffer *marker_buf,
+                      VkDeviceSize marker_offset, uint32_t value)
+{
+   TU_CALLX(cmd->device, dgc_probe_dispatch)(cmd, buf, offset, marker_buf,
+                                             marker_offset, value);
 }
 
 template <chip CHIP>

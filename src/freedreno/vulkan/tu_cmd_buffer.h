@@ -1075,4 +1075,13 @@ tu_fdm_num_layers(const struct tu_cmd_buffer *cmd)
       (cmd->state.fdm_per_layer ? cmd->state.framebuffer->layers : 1);
 }
 
+/* DGC M2.0 spike (см. tu_dgc_probe.cc): диспатчит лениво созданный
+ * внутренний compute-шейдер, который записывает payload (4 dword'а =
+ * PM4-пакет CP_MEM_WRITE) в буфер, затем эмитит барьер и
+ * CP_INDIRECT_BUFFER на этот payload. Читается через dlsym из
+ * стенда /tmp/opencode/dgcprobe. */
+void tu_dgc_probe_dispatch(struct tu_cmd_buffer *cmd, struct tu_buffer *buf,
+                           VkDeviceSize offset, struct tu_buffer *marker_buf,
+                           VkDeviceSize marker_offset, uint32_t value);
+
 #endif /* TU_CMD_BUFFER_H */

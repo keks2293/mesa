@@ -385,6 +385,14 @@ struct tu_device
 
    struct tu_shader *empty_tcs, *empty_tes, *empty_gs, *empty_fs, *empty_fs_fdm;
 
+   /* DGC M2.0 spike: внутренний probe compute-шейдер, создаётся лениво на
+    * первом вызове tu_dgc_probe_dispatch (однопоточный стенд). */
+   struct tu_shader *dgc_probe_shader;
+   /* Диагностика R1a: verify-шейдер (ldg payload[3] → stg marker[1]) —
+    * отделяет «память обновилась после барьера (SP видит)» от «CP/PFE
+    * видит устаревшее». */
+   struct tu_shader *dgc_probe_verify_shader;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    BITSET_DECLARE(custom_border_color, TU_BORDER_COLOR_COUNT);
