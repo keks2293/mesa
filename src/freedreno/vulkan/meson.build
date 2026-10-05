@@ -43,6 +43,7 @@ libtu_files = files(
   'tu_cs.cc',
   'tu_device.cc',
   'tu_descriptor_set.cc',
+  'tu_dgc.cc',
   'tu_dgc_probe.cc',
   'tu_dynamic_rendering.cc',
   'tu_event.cc',
