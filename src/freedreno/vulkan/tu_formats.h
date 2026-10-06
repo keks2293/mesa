@@ -40,6 +40,9 @@ bool tu6_format_list_has_swaps(const VkImageFormatListCreateInfo *fmt_list);
 bool tu6_format_list_reinterprets_r8g8_r16(
    enum pipe_format format, const VkImageFormatListCreateInfo *fmt_list);
 
+bool tu6_format_list_swaps_are_uniform(
+   const VkImageFormatListCreateInfo *fmt_list);
+
 /* True if a mutable image created with this format list has to be demoted to
  * the linear fallback, i.e. the list reinterprets the image in a way the
  * tiled layout cannot describe.  Sparse residency requires the tiled layout,

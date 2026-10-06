@@ -15,6 +15,8 @@
 
 #include "common/freedreno_stompable_regs.h"
 /* for fd_get_driver/device_uuid() */
+#include <stdlib.h>
+#include <string.h>
 #include "util/cache_ops.h"
 #include "util/disk_cache.h"
 #include "util/driconf.h"
@@ -1727,6 +1729,113 @@ static const VkQueueFamilyProperties tu_sparse_queue_family_properties = {
    .minImageTransferGranularity = { 1, 1, 1 },
 };
 
+/**
+ * TU_FORCE_PROPS — принудительно поднимает булевы флаги fd6_gpu_info, которых
+ * нет в таблице устройства.
+ *
+ * Зачем: значения в freedreno_devices.py — это наблюдения из блоба Qualcomm для
+ * конкретного чипа, а не деление по поколению. Поэтому неизвестно, умеет ли
+ * наш чип то, что заявлено только для соседнего (например, a750 в
+ * a7xx_gen3 имеет load_shader_consts_via_preamble и has_generic_clear, а
+ * наш a740 в a7xx_gen2 — нет). Переопределение позволяет проверить такую
+ * гипотезу одной пересборкой, а не пересборкой на каждый флаг.
+ *
+ * Значение — имена через запятую, неизвестные имена ругаются в лог. Всё, что
+ * применилось, тоже печатается, чтобы по логу было видно, что флаг реально
+ * учтён, а не молча проигнорирован.
+ *
+ * TU_MAX_DRAW_STATES — отдельно, потому что это число, а не флаг.
+ *
+ * ВАЖНО: переопределение ничем не проверяется. Неверный флаг даёт визуальную
+ * порчу или зависание GPU. Корректность проверяется тестами (scripts/
+ * run-test.sh), а не этим кодом.
+ */
+static void
+tu_force_props(struct fd_dev_info *info)
+{
+   const char *mds = getenv("TU_MAX_DRAW_STATES");
+   if (mds) {
+      info->props.max_draw_states = strtoul(mds, NULL, 0);
+      mesa_logi("TU_MAX_DRAW_STATES: max_draw_states = %u",
+                info->props.max_draw_states);
+   }
+
+   const char *force = getenv("TU_FORCE_PROPS");
+   if (!force)
+      return;
+
+   struct {
+      const char *name;
+      bool *val;
+   } flags[] = {
+      { "load_shader_consts_via_preamble",
+        &info->props.load_shader_consts_via_preamble },
+      { "load_inline_uniforms_via_preamble_ldgk",
+        &info->props.load_inline_uniforms_via_preamble_ldgk },
+      { "has_generic_clear", &info->props.has_generic_clear },
+      { "has_gmem_vpc_attr_buf", &info->props.has_gmem_vpc_attr_buf },
+      { "ubwc_all_formats_compatible",
+        &info->props.ubwc_all_formats_compatible },
+      { "has_compliant_dp4acc", &info->props.has_compliant_dp4acc },
+      { "has_persistent_counter", &info->props.has_persistent_counter },
+      { "has_abs_bin_mask", &info->props.has_abs_bin_mask },
+      { "ubwc_coherency_quirk", &info->props.ubwc_coherency_quirk },
+      { "enable_tp_ubwc_flag_hint",
+        &info->props.enable_tp_ubwc_flag_hint },
+   };
+
+   char *buf = strdup(force);
+   if (!buf)
+      return;
+
+   for (char *item = strtok(buf, ","); item; item = strtok(NULL, ",")) {
+      bool found = false;
+
+      /* QCTDD-квирки — битовые поля, адрес брать нельзя: присваиваем
+       * напрямую. Имена в env оставлены старые, для совместимости с логами. */
+      if (!strcmp(item, "cs_lock_unlock_quirk")) {
+         info->quirks.QCTDD08407086_cs_lock_unlock = true;
+         mesa_logi("TU_FORCE_PROPS: %s", item);
+         continue;
+      }
+      if (!strcmp(item, "r8g8_faulty_fast_clear_quirk")) {
+         info->quirks.QCTDD12766770_r8g8_fc_alignment = true;
+         mesa_logi("TU_FORCE_PROPS: %s", item);
+         continue;
+      }
+
+      for (unsigned i = 0; i < ARRAY_SIZE(flags); i++) {
+         if (strcmp(item, flags[i].name))
+            continue;
+
+         *flags[i].val = true;
+
+         /* VPC в GMEM без размеров буфера бесполезен: кеш не выделяется, а
+          * обращения к нему идут по нулевому размеру. Подставляем значения
+          * a750 (a7xx_gen3), если их не задали явно, и говорим об этом.
+          */
+         if (!strcmp(item, "has_gmem_vpc_attr_buf")) {
+            if (!info->props.sysmem_vpc_attr_buf_size)
+               info->props.sysmem_vpc_attr_buf_size = 0x20000;
+            if (!info->props.gmem_vpc_attr_buf_size)
+               info->props.gmem_vpc_attr_buf_size = 0xc000;
+            mesa_logi("TU_FORCE_PROPS: vpc_attr_buf_size sysmem=0x%x gmem=0x%x",
+                      info->props.sysmem_vpc_attr_buf_size,
+                      info->props.gmem_vpc_attr_buf_size);
+         }
+
+         mesa_logi("TU_FORCE_PROPS: %s", flags[i].name);
+         found = true;
+         break;
+      }
+
+      if (!found)
+         mesa_logw("TU_FORCE_PROPS: неизвестный флаг '%s'", item);
+   }
+
+   free(buf);
+}
+
 VkResult
 tu_physical_device_init(struct tu_physical_device *device,
                         struct tu_instance *instance)
@@ -1741,8 +1850,10 @@ tu_physical_device_init(struct tu_physical_device *device,
                                device->dev_id.chip_id, device->dev_id.gpu_id);
    }
 
-   const struct fd_dev_info info = fd_dev_info(&device->dev_id);
+   struct fd_dev_info info = fd_dev_info(&device->dev_id);
    assert(info.chip);
+
+   tu_force_props(&info);
 
    /* Print a suffix if raytracing is disabled by the SW fuse, in an attempt
     * to avoid confusion when apps don't work.

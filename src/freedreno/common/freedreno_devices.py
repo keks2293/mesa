@@ -877,6 +877,15 @@ a7xx_gen2 = GPUProps(
         has_image_processing = True,
         has_64b_image_atomics = True,
         has_implicit_fragface_fragcoord_ij_linear = True,
+        # Generic clear (event-запись вместо cp_blit) и квирк-ограничитель
+        # включаются парой: квирк один ничего не делает (внешний && в
+        # use_generic_clear_for_image_clear), а без него очистки R8G8
+        # generic-путём дают GPU fault (fast-clear + размеры типа 960x540 +
+        # GMEM renderpass, tu_clear_blit.cc). Замеры 30.09.2026: vkmark
+        # vertex/shading/texture -61..-65%, RE4 0% (медиана 12.4 совпала,
+        # n=77), расхождений кадров нет. См. раздел 15 docs/analysis.md.
+        has_generic_clear = True,
+        QCTDD12766770 = True,
 
         QCTDD08901551 = True,
         QCTDD08517960 = True,

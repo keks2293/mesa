@@ -540,10 +540,10 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
     * Depth and stencil formats cannot be reintepreted as another format, and
     * cannot be linear with sysmem rendering, so don't fall back for those.
     *
-    * TODO:
-    * - if the fmt_list contains only formats which are swapped, but compatible
-    *   with each other (B8G8R8A8_UNORM and B8G8R8A8_UINT for example), then
-    *   tiling is still possible
+    * A list which is swapped but describes the stored words the same way
+    * (B8G8R8A8_UNORM together with B8G8R8A8_UINT, say) does keep the tiled
+    * layout: one layout describes every format of such a list, see
+    * tu6_format_list_swaps_are_uniform().
     */
    if ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
        !vk_format_is_depth_or_stencil(image->vk.format)) {
@@ -568,7 +568,6 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
                   fmt_list ? "present" : "missing");
             }
             ubwc_enabled = false;
-            force_linear_tile = true;
          } else if (!mutable_ubwc_fc) {
             if (ubwc_enabled) {
                if (fmt_list && fmt_list->viewFormatCount == 2) {
@@ -595,7 +594,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
             bool r8g8_r16 = tu6_format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
             bool fmt_list_has_swaps = tu6_format_list_has_swaps(fmt_list);
 
-            if (r8g8_r16 || fmt_list_has_swaps) {
+            if (r8g8_r16 ||
+                (fmt_list_has_swaps &&
+                 !tu6_format_list_swaps_are_uniform(fmt_list))) {
                ubwc_enabled = false;
                force_linear_tile = true;
             }
