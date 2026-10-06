@@ -15,6 +15,8 @@
  * extension); the spike test program resolves it via dlsym().
  */
 
+#include <stdio.h>
+
 #include "util/macros.h"
 
 #include "tu_buffer.h"
@@ -39,6 +41,12 @@ vkCmdTuDgcProbeDispatchEXT(VkCommandBuffer commandBuffer,
                            VkBuffer markerBuffer,
                            VkDeviceSize markerOffset,
                            uint32_t value);
+
+/* M2.3 debug: дамп последнего сгенерированного DGC stream-BO (после
+ * GPU-записи) в stderr. bytes — сколько байт выводить (округляется
+ * вниз до dword, не больше размера BO). */
+VKAPI_ATTR void VKAPI_CALL
+vkCmdTuDgcDumpStreamEXT(VkDevice device, uint32_t bytes);
 
 }
 
@@ -91,4 +99,29 @@ vkCmdTuDgcProbeDispatchEXT(VkCommandBuffer commandBuffer,
       return;
 
    tu_dgc_probe_dispatch(cmd, buf, offset, marker_buf, markerOffset, value);
+}
+
+/* M2.3 debug: см. объявление выше. BO жив, пока жив записавший его
+ * command buffer (dgc_stream_bos), — зовем до vkDestroyCommandBuffer. */
+extern "C" PUBLIC VKAPI_ATTR void
+   __attribute__((used, retain)) VKAPI_CALL
+vkCmdTuDgcDumpStreamEXT(VkDevice device, uint32_t bytes)
+{
+   VK_FROM_HANDLE(tu_device, dev, device);
+   struct tu_bo *bo = dev->dgc_last_stream_bo;
+   if (!bo || bytes == 0)
+      return;
+   if (tu_bo_map(dev, bo, NULL) != VK_SUCCESS) {
+      fprintf(stderr, "dgc_stream_dump: map failed\n");
+      return;
+   }
+   const uint32_t *p = (const uint32_t *)bo->map;
+   const uint32_t n = MIN2(bytes, dev->dgc_last_stream_size) / 4;
+   fprintf(stderr, "dgc_stream_dump: iova=%#llx size=%u\n",
+           (unsigned long long)bo->iova, dev->dgc_last_stream_size);
+   for (uint32_t i = 0; i < n; i++)
+      fprintf(stderr, "  %04u: %08x%s", i, p[i], (i % 4 == 3) ? "\n" : " ");
+   if (n % 4)
+      fprintf(stderr, "\n");
+   (void)tu_bo_unmap(dev, bo, false);
 }

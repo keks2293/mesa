@@ -793,6 +793,11 @@ struct tu_cmd_buffer
    struct util_dynarray msrtss_color_temporaries;
    struct util_dynarray msrtss_depth_temporaries;
 
+   /* DGC M2.3: driver-internal PM4 stream BOs created at
+    * vkCmdExecuteGeneratedCommandsEXT (struct tu_bo *). Freed on
+    * cmd buffer reset/destroy. */
+   struct util_dynarray dgc_stream_bos;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    uint32_t vsc_draw_strm_offset, vsc_draw_strm_size_offset;
@@ -1083,5 +1088,12 @@ tu_fdm_num_layers(const struct tu_cmd_buffer *cmd)
 void tu_dgc_probe_dispatch(struct tu_cmd_buffer *cmd, struct tu_buffer *buf,
                            VkDeviceSize offset, struct tu_buffer *marker_buf,
                            VkDeviceSize marker_offset, uint32_t value);
+
+/* DGC M2.3: vkCmdExecuteGeneratedCommandsEXT. Диспатчит внутренний
+ * preprocess-шейдер (последовательности -> PM4-стрим), эмитит барьер M2.0
+ * и CP_INDIRECT_BUFFER на стрим. Тело chip-зависимое — в tu_cmd_buffer.cc. */
+void tu_dgc_execute_generated_commands(struct tu_cmd_buffer *cmd,
+                                       VkBool32 isPreprocessed,
+                                       const VkGeneratedCommandsInfoEXT *pGeneratedCommandsInfo);
 
 #endif /* TU_CMD_BUFFER_H */

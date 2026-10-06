@@ -490,6 +490,38 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       submit_add_entries(device, submit, &dump_cmds, cs->entries,
                          cs->entry_count);
 
+      if (getenv("DGC_DUMP")) {
+         struct {
+            const char *name;
+            struct tu_cs *cs;
+         } css[] = {
+            { "cs", &cmd_buffer->cs },
+            { "draw_cs", &cmd_buffer->draw_cs },
+            { "tile_store_cs", &cmd_buffer->tile_store_cs },
+            { "draw_epilogue_cs", &cmd_buffer->draw_epilogue_cs },
+            { "sub_cs", &cmd_buffer->sub_cs },
+         };
+         for (unsigned c = 0; c < ARRAY_SIZE(css); c++) {
+            struct tu_cs *cs2 = css[c].cs;
+            for (uint32_t e = 0; e < cs2->entry_count; e++) {
+               const struct tu_cs_entry *en = &cs2->entries[e];
+               fprintf(stderr,
+                       "dgc_submit: cb[%u] %s entry[%u] iova=%#llx off=%u size=%u name=%s\n",
+                       i, css[c].name, e,
+                       (unsigned long long)en->bo->iova, en->offset,
+                       (unsigned)en->size,
+                       en->bo->name ? en->bo->name : "?");
+               if (en->bo->map) {
+                  const uint32_t *p = (const uint32_t *)en->bo->map +
+                     (en->offset / sizeof(uint32_t));
+                  uint32_t n = en->size / sizeof(uint32_t);
+                  for (uint32_t w = 0; w < n && w < 400; w++)
+                     fprintf(stderr, "  %04x: %08x\n", w, p[w]);
+               }
+            }
+         }
+      }
+
       if (u_trace_submission_data &&
           u_trace_submission_data->timestamp_copy_data) {
          struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
