@@ -161,6 +161,106 @@ tu6_format_list_reinterprets_r8g8_r16(
    return has_r8g8 && has_non_r8g8;
 }
 
+/* Formats which are swapped but only differ in how the very same bits are
+ * interpreted (B8G8R8A8_UNORM together with B8G8R8A8_UINT, say) describe a
+ * single layout: the swap is applied when a view is sampled, using the
+ * view's own format, not when the image is stored.  The comparison therefore
+ * has to be about the interpretation of the stored words - channel order,
+ * channel and block size, shape of the block - and not about the hardware
+ * swap, which R8G8B8A8 and B8G8R8A8 share.  Those two are not
+ * reinterpretations of each other, a list mixing them still has to fall back
+ * to linear.
+ *
+ * A format with a single channel has no channel order for two views to
+ * disagree about: R32_UINT reads the stored word as it is, however that word
+ * was written.  Such a format must not by itself push the list to linear; it
+ * only has to agree on the texel block, because the tiled layout is a
+ * function of the block size alone (fd6_layout.c: layout->cpp =
+ * util_format_get_blocksize()).
+ *
+ * The list this buys is the one vkd3d builds for a typeless BGRA8 resource
+ * created with D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS: the D3D11 typed
+ * UAV load rule (vkd3d-proton resource.c:393-401) appends R32{U,I,F} to every
+ * 32-bit typeless format.  On the stock check that list went linear, because
+ * B8G8R8A8 carries the WXYZ swap and R32 does not - but on the tiled layout
+ * fd6_pipe2swap() hands WZYX to *every* format that is not is_mutable
+ * (fd6_format_table.c:396), so that difference has no representation there
+ * and cannot be what demotes the image.
+ *
+ * The lists that must keep going to linear are unaffected: {BGRA8, RGBA8}
+ * (two multi-channel formats, opposite channel order) and NV12.
+ */
+bool
+tu6_format_list_swaps_are_uniform(const VkImageFormatListCreateInfo *fmt_list)
+{
+   if (!fmt_list || fmt_list->viewFormatCount < 2)
+      return false;
+
+   /* The reference for everything about channel order is the first format
+    * in the list that has a channel order at all.
+    */
+   enum pipe_format ref_format = PIPE_FORMAT_NONE;
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      VkFormat vk_format = fmt_list->pViewFormats[i];
+
+      /* Layouts we don't model here (depth/stencil, compressed, multi-planar)
+       * are not something a description comparison can speak about.
+       */
+      if (vk_format_is_depth_or_stencil(vk_format) ||
+          vk_format_is_compressed(vk_format) ||
+          vk_format_get_plane_count(vk_format) > 1)
+         return false;
+
+      if (util_format_description(vk_format_to_pipe_format(vk_format))
+              ->nr_channels > 1) {
+         ref_format = vk_format_to_pipe_format(vk_format);
+         break;
+      }
+   }
+
+   /* Nothing in the list has more than one channel, so nothing in it can
+    * disagree about the order of the channels of a stored word.
+    */
+   if (ref_format == PIPE_FORMAT_NONE)
+      return true;
+
+   const struct util_format_description *ref =
+      util_format_description(ref_format);
+   enum a3xx_color_swap swap =
+      tu6_format_texture(ref_format, TILE6_LINEAR, false).swap;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      enum pipe_format format = vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
+      const struct util_format_description *desc =
+         util_format_description(format);
+
+      if (desc->block.bits != ref->block.bits ||
+          desc->block.width != ref->block.width ||
+          desc->block.height != ref->block.height)
+         return false;
+
+      /* A single channel has no channel order to disagree about. */
+      if (desc->nr_channels < 2)
+         continue;
+
+      if (desc->nr_channels != ref->nr_channels ||
+          tu6_format_texture(format, TILE6_LINEAR, false).swap != swap)
+         return false;
+
+      /* The swizzle is what says which channel of the stored word ends up
+       * where, so it is what tells B8G8R8A8 (Z,Y,X,W) and R8G8B8A8 (X,Y,Z,W)
+       * apart.
+       */
+      for (unsigned c = 0; c < 4; c++) {
+         if (desc->swizzle[c] != ref->swizzle[c] ||
+             desc->channel[c].size != ref->channel[c].size)
+            return false;
+      }
+   }
+
+   return true;
+}
+
 bool
 tu6_mutable_format_list_forces_linear(const struct fd_dev_info *info,
                                       VkFormat format,
@@ -188,9 +288,12 @@ tu6_mutable_format_list_forces_linear(const struct fd_dev_info *info,
    if (info->props.ubwc_all_formats_compatible)
       return false;
 
-   return tu6_format_list_reinterprets_r8g8_r16(
-             vk_format_to_pipe_format(format), fmt_list) ||
-          tu6_format_list_has_swaps(fmt_list);
+   if (tu6_format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(format),
+                                             fmt_list))
+      return true;
+
+   return tu6_format_list_has_swaps(fmt_list) &&
+          !tu6_format_list_swaps_are_uniform(fmt_list);
 }
 
 bool
