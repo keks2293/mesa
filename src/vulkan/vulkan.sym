@@ -3,6 +3,10 @@
 		vk_icdGetInstanceProcAddr;
 		vk_icdGetPhysicalDeviceProcAddr;
 		vk_icdNegotiateLoaderICDInterfaceVersion;
+		# DGC development probe (M1 spike), see
+		# src/freedreno/vulkan/tu_dgc_probe.cc
+		vkCmdTuDgcProbeWriteEXT;
+		vkCmdTuDgcProbeDispatchEXT;
 
 	local:
 		# When static linking LLVM, all its symbols are public API.
