@@ -21,6 +21,7 @@
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
 #include "tu_cs.h"
+#include "tu_dgc.h"
 #include "tu_event.h"
 #include "tu_image.h"
 #include "tu_knl.h"
@@ -4360,6 +4361,12 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
    util_dynarray_fini(&cmd_buffer->vis_stream_bos);
    util_dynarray_fini(&cmd_buffer->vis_stream_cs_bos);
 
+   /* DGC M2.3: stream BO'ы из vkCmdExecuteGeneratedCommandsEXT. */
+   util_dynarray_foreach (&cmd_buffer->dgc_stream_bos, struct tu_bo *, bo) {
+      tu_bo_finish(cmd_buffer->device, *bo);
+   }
+   util_dynarray_fini(&cmd_buffer->dgc_stream_bos);
+
    vk_command_buffer_finish(&cmd_buffer->vk);
    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer);
 }
@@ -4415,6 +4422,12 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       tu_destroy_memory(cmd_buffer->device, *mem);
    }
    util_dynarray_clear(&cmd_buffer->msrtss_depth_temporaries);
+
+   /* DGC M2.3: stream BO'ы больше не референцируются (cs сброшены). */
+   util_dynarray_foreach (&cmd_buffer->dgc_stream_bos, struct tu_bo *, bo) {
+      tu_bo_finish(cmd_buffer->device, *bo);
+   }
+   util_dynarray_clear(&cmd_buffer->dgc_stream_bos);
 
    u_trace_fini(&cmd_buffer->trace);
    u_trace_init(&cmd_buffer->trace, &cmd_buffer->device->trace_context);
@@ -10047,6 +10060,797 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
 
    cmd->state.total_dispatches++;
 }
+
+/* ---------------- DGC M2.3: vkCmdExecuteGeneratedCommandsEXT -----------
+ *
+ * Реальный preprocess: внутренний 1-потоковый compute-шейдер читает
+ * layout-дескриптор (BO на layout'е, tu_dgc_gpu_layout) и последовательности
+ * по indirectAddress, пишет сгенерированный PM4-стрим в stream-BO:
+ *   PC  -> PKT4(pc_base + dst/4, n) + n dword'ов из последовательности;
+ *   SI  -> PKT4(pc_base + dst/4, 1) + индекс последовательности;
+ *   DRAW / DRAW_INDEXED
+ *       -> CP_DRAW_INDIRECT_MULTI (заголовок + 9), аргументы draw'а
+ *          (indexCount...firstInstance) CP читает сам из seq + src.
+ * Далее — барьер M2.0 (CLEAN -> WFI -> WFM) и CP_INDIRECT_BUFFER на стрим.
+ *
+ * Область M2.3: PC/SI/DRAW/DRAW_INDEXED. DISPATCH/IB/VB/IES/RT и
+ * *_COUNT-варианты отказываются на Execute громко (M2.4+).
+ *
+ * Параметры (push constants внутреннего шейдера, 19 dword'ов; idiom M2.0):
+ *   [0..1]   VA layout-дескриптора,
+ *   [2..3]   indirectAddress,
+ *   [4..5]   sequenceCountAddress (0 = нет),
+ *   [6..7]   VA stream-BO,
+ *   [8]      max_sequence_count,
+ *   [9]      pc_base_reg = SP_SHARED_CONSTANT_GFX_REG(CHIP, lo_dwords)
+ *            привязанного пайплайна (цель PC-токенов),
+ *   [10..15] DRAW_INDEXED: initiator, word1 (OPCODE|DST_OFF),
+ *            index VA (qw), max_index_count, pkt7-заголовок (cnt=9),
+ *   [16..18] DRAW: pkt7-заголовок (cnt=6), initiator,
+ *            word1 (OPCODE|DST_OFF).
+ * Payload не инлайнит команду draw: CP сам читает Vulkan-формат
+ * (indexCount/instanceCount/firstIndex/firstVertex/firstInstance) по
+ * VA seq+src, как штатные tu_CmdDraw{Indexed}Indirect.
+ *
+ * Заголовок PKT4 считается в шейдере (регистр динамический): parity —
+ * XOR-fold, как в pm4_pkt4_hdr (freedreno_pm4.h).
+ *
+ * Стрим: RP активен (state.pass) -> draw_cs, иначе cs. Порядок корректен:
+ * cs -> CALL(draw_cs) эмитится в конце RP (tu_cmd_render), поэтому всё
+ * дописанное в draw_cs во время RP покрывается.
+ */
+
+static struct tu_pipeline_layout dgc_preprocess_layout;
+
+static inline nir_def *
+dgc_pc_u32(nir_builder *b, uint32_t byte_off)
+{
+   return nir_load_push_constant(b, 1, 32, nir_imm_int(b, byte_off),
+                                 .base = 0, .range = byte_off + 4);
+}
+
+static inline nir_def *
+dgc_pc_u64(nir_builder *b, uint32_t byte_off)
+{
+   nir_def *v = nir_load_push_constant(b, 2, 32, nir_imm_int(b, byte_off),
+                                       .base = 0, .range = byte_off + 8);
+   return nir_pack_64_2x32(b, v);
+}
+
+static inline nir_def *
+dgc_imm64(nir_builder *b, uint64_t value)
+{
+   return nir_pack_64_2x32(
+      b, nir_vec2(b, nir_imm_int(b, (uint32_t)value),
+                  nir_imm_int(b, (uint32_t)(value >> 32))));
+}
+
+/* 32-битный select по маске. cond — 1-битный (из сравнений);
+ * nir_icsel_eqz требует 32-битный src0 (tint) — hence b2i32.
+ * IR3 не знает b32csel; nir_icsel_eqz нативный: (m == 0) ? a : b. */
+static inline nir_def *
+dgc_sel(nir_builder *b, nir_def *cond, nir_def *if_zero, nir_def *if_nonzero)
+{
+   return nir_icsel_eqz(b, nir_b2i32(b, cond), if_zero, if_nonzero);
+}
+
+/* pm4_odd_parity_bit: XOR-swap fold. PM4 требует ODD-чётность:
+ * 1, если число установленных бит ЧЁТНОЕ (полный fold даёт
+ * обычный parity — инвертируем). */
+static nir_def *
+dgc_parity(nir_builder *b, nir_def *x)
+{
+   x = nir_ixor(b, x, nir_ushr(b, x, nir_imm_int(b, 16)));
+   x = nir_ixor(b, x, nir_ushr(b, x, nir_imm_int(b, 8)));
+   x = nir_ixor(b, x, nir_ushr(b, x, nir_imm_int(b, 4)));
+   x = nir_ixor(b, x, nir_ushr(b, x, nir_imm_int(b, 2)));
+   x = nir_ixor(b, x, nir_ushr(b, x, nir_imm_int(b, 1)));
+   return nir_ixor(b, nir_iand(b, x, nir_imm_int(b, 1)),
+                   nir_imm_int(b, 1));
+}
+
+/* pm4_pkt4_hdr(reg, cnt) (reg <= 0x3ffff у нас всегда). */
+static nir_def *
+dgc_pkt4_hdr(nir_builder *b, nir_def *reg, nir_def *cnt)
+{
+   nir_def *regm = nir_iand(b, reg, nir_imm_int(b, 0x3ffff));
+   nir_def *hdr = nir_imm_int(b, 0x40000000);
+   hdr = nir_ior(b, hdr, cnt);
+   hdr = nir_ior(b, hdr, nir_ishl(b, dgc_parity(b, cnt), nir_imm_int(b, 7)));
+   hdr = nir_ior(b, hdr, nir_ishl(b, regm, nir_imm_int(b, 8)));
+   hdr = nir_ior(b, hdr, nir_ishl(b, dgc_parity(b, regm), nir_imm_int(b, 27)));
+   return hdr;
+}
+
+/* Адрес dword'а off в stream-BO. */
+static inline nir_def *
+dgc_stream_addr(nir_builder *b, nir_def *stream_va, nir_def *off)
+{
+   return nir_iadd(b, stream_va,
+                   nir_ishl(b, nir_pack_64_2x32(
+                                  b, nir_vec2(b, off, nir_imm_int(b, 0))),
+                            dgc_imm64(b, 2)));
+}
+
+static void
+dgc_store(nir_builder *b, nir_def *value, nir_def *addr)
+{
+   nir_store_global(b, value, addr, .access = ACCESS_NON_READABLE,
+                    .align_mul = 4);
+}
+
+static VkResult
+tu_dgc_create_preprocess_shader(struct tu_device *dev)
+{
+   nir_builder _b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+                                                   "dgc preprocess cs");
+   nir_builder *b = &_b;
+
+   _b.shader->options = ir3_get_compiler_options(dev->compiler);
+   _b.shader->info.workgroup_size[0] = 1;
+   _b.shader->info.workgroup_size[1] = 1;
+   _b.shader->info.workgroup_size[2] = 1;
+
+   /* Параметры (19 dword'ов push constants, см. комментарий выше). */
+   nir_def *desc_va = dgc_pc_u64(b, 0);
+   nir_def *indirect_va = dgc_pc_u64(b, 8);
+   nir_def *count_lo = dgc_pc_u32(b, 16);
+   nir_def *count_hi = dgc_pc_u32(b, 20);
+   nir_def *count_va =
+      nir_pack_64_2x32(b, nir_vec2(b, count_lo, count_hi));
+   nir_def *stream_va = dgc_pc_u64(b, 24);
+   nir_def *max_count = dgc_pc_u32(b, 32);
+   nir_def *pc_base = dgc_pc_u32(b, 36);
+   nir_def *initiator = dgc_pc_u32(b, 40);
+   nir_def *multi1 = dgc_pc_u32(b, 44);
+   nir_def *idx_lo = dgc_pc_u32(b, 48);
+   nir_def *idx_hi = dgc_pc_u32(b, 52);
+   nir_def *index_va = nir_pack_64_2x32(b, nir_vec2(b, idx_lo, idx_hi));
+   nir_def *max_idx = dgc_pc_u32(b, 56);
+   nir_def *multi_hdr = dgc_pc_u32(b, 60);
+   nir_def *multi_hdr6 = dgc_pc_u32(b, 64);
+   nir_def *initiator_nonidx = dgc_pc_u32(b, 68);
+   nir_def *multi1_nonidx = dgc_pc_u32(b, 72);
+
+   nir_def *one = nir_imm_int(b, 1);
+   nir_def *two = nir_imm_int(b, 2);
+   nir_def *three = nir_imm_int(b, 3);
+   nir_def *four = nir_imm_int(b, 4);
+   nir_def *five = nir_imm_int(b, 5);
+   nir_def *six = nir_imm_int(b, 6);
+   nir_def *seven = nir_imm_int(b, 7);
+   nir_def *eight = nir_imm_int(b, 8);
+   nir_def *nine = nir_imm_int(b, 9);
+   nir_def *ten = nir_imm_int(b, 10);
+
+   /* Дескриптор: stride (0), token_count (4). */
+   nir_def *stride = nir_load_global(b, 1, 32, desc_va, .align_mul = 4);
+   nir_def *token_count =
+      nir_load_global(b, 1, 32, nir_iadd(b, desc_va, dgc_imm64(b, 4)),
+                      .align_mul = 4);
+
+    /* count = sequenceCountAddress != 0 ? min(load, max) : max.
+     * Load из нулевого адреса не делаем: если адрес 0, грузим с VA
+     * layout-дескриптора (валидный) и результат отбрасываем. */
+    nir_def *count_null =
+       nir_iand(b, nir_ieq_imm(b, count_lo, 0),
+                nir_ieq_imm(b, count_hi, 0));
+    nir_def *count;
+    {
+       nir_def *cv = nir_unpack_64_2x32(b, count_va);
+       nir_def *dv = nir_unpack_64_2x32(b, desc_va);
+       /* count_null == 0 <=> адрес валиден. dgc_sel(m,a,b) = (m==0)?a:b. */
+       nir_def *safe_va =
+          nir_pack_64_2x32(
+             b,
+             nir_vec2(
+                b,
+                dgc_sel(b, count_null, nir_channels(b, cv, 0x1),
+                        nir_channels(b, dv, 0x1)),
+                dgc_sel(b, count_null, nir_channels(b, cv, 0x2),
+                        nir_channels(b, dv, 0x2))));
+       nir_def *count_loaded =
+          nir_load_global(b, 1, 32, safe_va, .align_mul = 4);
+       count = dgc_sel(b, count_null,
+                       nir_imin(b, count_loaded, max_count), max_count);
+    }
+
+    /* Loop-carried состояние (i — индекс последовательности,
+     * t — индекс токена, off — текущий dword в стриме,
+     * k — dword данных PC) — в NIR-registrach (idiom gl.Register):
+     * nir_lower_reg_intrinsics_to_ssa превращает их в SSA-phi.
+     * IR3 не понимает load/store nir_var_shader_temp (UNREACHABLE в
+     * emit_intrinsic, ir3_compiler_nir.c) — idiom RADV-переменных
+     * здесь неприменим. */
+    nir_def *reg_i = nir_decl_reg(b, 1, 32, 0);
+    nir_def *reg_t = nir_decl_reg(b, 1, 32, 0);
+    nir_def *reg_off = nir_decl_reg(b, 1, 32, 0);
+    nir_def *reg_k = nir_decl_reg(b, 1, 32, 0);
+    nir_store_reg(b, nir_imm_int(b, 0), reg_i);
+    /* off накапливается по всему стриму: последовательность i
+     * дописывает свои dwords после предыдущих (i * dwords_per_seq). */
+    nir_store_reg(b, nir_imm_int(b, 0), reg_off);
+
+    /* Цикл по последовательностям. */
+    nir_loop *seq_loop = nir_push_loop(b);
+    {
+       nir_def *i = nir_load_reg(b, reg_i);
+       nir_break_if(b, nir_uge(b, i, count));
+
+       /* seq = indirect_va + i * stride (64-битное; i*stride <
+        * indirectAddressSize, перенос в старший бит исключён bounds'ом). */
+       nir_def *is = nir_imul(b, i, stride);
+       nir_def *seq = nir_iadd(
+          b, indirect_va,
+          nir_pack_64_2x32(b, nir_vec2(b, is, nir_imm_int(b, 0))));
+
+       /* На последовательность: сброс только счётчика токенов.
+        * Смещение в стриме (reg_off) НЕ сбрасывается: каждая
+        * последовательность дописывает dwords после предыдущих. */
+       nir_store_reg(b, nir_imm_int(b, 0), reg_t);
+
+       nir_loop *tok_loop = nir_push_loop(b);
+       {
+          nir_def *t = nir_load_reg(b, reg_t);
+          nir_break_if(b, nir_uge(b, t, token_count));
+
+          /* off — текущий dword в стриме (phi; обновляется один раз
+           * в конце итерации, см. dw ниже). */
+          nir_def *off = nir_load_reg(b, reg_off);
+
+          /* Токен: type/src/dst/size по 4 байта, stride 16, tokens[] с +16. */
+          nir_def *tok_va = nir_iadd(
+             b, desc_va,
+             nir_iadd(b, nir_ishl(b, nir_pack_64_2x32(
+                                    b, nir_vec2(b, t, nir_imm_int(b, 0))),
+                                 dgc_imm64(b, 4)),
+                      dgc_imm64(b, 16)));
+          nir_def *type = nir_load_global(b, 1, 32, tok_va, .align_mul = 4);
+          nir_def *src =
+             nir_load_global(b, 1, 32, nir_iadd(b, tok_va, dgc_imm64(b, 4)),
+                             .align_mul = 4);
+          nir_def *dst =
+             nir_load_global(b, 1, 32, nir_iadd(b, tok_va, dgc_imm64(b, 8)),
+                             .align_mul = 4);
+          nir_def *size =
+             nir_load_global(b, 1, 32, nir_iadd(b, tok_va, dgc_imm64(b, 12)),
+                             .align_mul = 4);
+          nir_def *src64 =
+             nir_pack_64_2x32(b, nir_vec2(b, src, nir_imm_int(b, 0)));
+
+          /* Флаги типов токена (0 или ~0): нужны и для веток,
+           * и для расчёта dwords токена (dw) в конце итерации. */
+          nir_def *is_pc =
+             nir_ior(b,
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_CONSTANT_EXT),
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_EXT));
+          nir_def *is_si =
+             nir_ior(b,
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_SEQUENCE_INDEX_EXT),
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_PUSH_DATA_SEQUENCE_INDEX_EXT));
+          nir_def *is_draw =
+             nir_ior(b,
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT),
+                     nir_ieq_imm(b, type,
+                                 VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT));
+
+          /* --- PC: PKT4-запись в SP_SHARED_CONSTANT_GFX --- */
+          struct nir_if *pcif = nir_push_if(b, is_pc);
+          {
+             nir_def *n = nir_ushr(b, size, nir_imm_int(b, 2));
+             nir_def *reg =
+                nir_iadd(b, pc_base, nir_ushr(b, dst, nir_imm_int(b, 2)));
+             dgc_store(b, dgc_pkt4_hdr(b, reg, n), dgc_stream_addr(b, stream_va, off));
+
+             /* Данные: k = 0..n-1, из seq + src + 4k; адрес записи
+              * off + 1 + k (off внутри токена неизменён). */
+             nir_store_reg(b, nir_imm_int(b, 0), reg_k);
+             nir_loop *k_loop = nir_push_loop(b);
+             {
+                nir_def *k = nir_load_reg(b, reg_k);
+                nir_break_if(b, nir_uge(b, k, n));
+
+                nir_def *src_addr =
+                   nir_iadd(b, seq,
+                            nir_iadd(b, src64,
+                                     nir_ishl(
+                                        b,
+                                        nir_pack_64_2x32(
+                                           b, nir_vec2(b, k, nir_imm_int(b, 0))),
+                                        dgc_imm64(b, 2))));
+                dgc_store(
+                   b, nir_load_global(b, 1, 32, src_addr, .align_mul = 4),
+                   dgc_stream_addr(
+                      b, stream_va, nir_iadd(b, off, nir_iadd(b, one, k))));
+                nir_store_reg(b, nir_iadd(b, k, one), reg_k);
+             }
+             nir_pop_loop(b, k_loop);
+          }
+          nir_pop_if(b, pcif);
+
+          /* --- SI: PKT4 + индекс последовательности (size == 4) --- */
+          struct nir_if *siif = nir_push_if(b, is_si);
+          {
+             nir_def *reg =
+                nir_iadd(b, pc_base, nir_ushr(b, dst, nir_imm_int(b, 2)));
+             dgc_store(b, dgc_pkt4_hdr(b, reg, one), dgc_stream_addr(b, stream_va, off));
+             dgc_store(b, i, dgc_stream_addr(b, stream_va, nir_iadd(b, off, one)));
+          }
+          nir_pop_if(b, siif);
+
+          /* --- DRAW / DRAW_INDEXED: CP_DRAW_INDIRECT_MULTI --- */
+          nir_def *is_draw_idx =
+             nir_ieq_imm(b, type,
+                         VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_INDEXED_EXT);
+          struct nir_if *dif = nir_push_if(b, is_draw);
+          {
+             /* Payload НЕ инлайнит команду draw: CP сам читает
+              * Vulkan-формат (indexCount/instanceCount/firstIndex/
+              * firstVertex/firstInstance) по VA = seq + src, как штатные
+              * tu_CmdDraw{Indexed}Indirect. Формат payload'а различается:
+              * indexed — 9 dword'ов (index VA + max), non-indexed — 6. */
+             nir_def *cmd_parts =
+                nir_unpack_64_2x32(b, nir_iadd(b, seq, src64));
+             /* dgc_sel(m, a, b) = (m == 0) ? a : b: a — значение для
+              * non-indexed DRAW, b — для DRAW_INDEXED. */
+             nir_def *hdr =
+                dgc_sel(b, is_draw_idx, multi_hdr6, multi_hdr);
+             nir_def *init =
+                dgc_sel(b, is_draw_idx, initiator_nonidx, initiator);
+             nir_def *m1 = dgc_sel(b, is_draw_idx, multi1_nonidx, multi1);
+
+             dgc_store(b, hdr, dgc_stream_addr(b, stream_va, off));
+             dgc_store(b, init,
+                       dgc_stream_addr(b, stream_va, nir_iadd(b, off, one)));
+             dgc_store(b, m1,
+                       dgc_stream_addr(b, stream_va, nir_iadd(b, off, two)));
+             dgc_store(b, one, /* drawCount = 1 */
+                       dgc_stream_addr(b, stream_va, nir_iadd(b, off, three)));
+
+             struct nir_if *didx_if = nir_push_if(b, is_draw_idx);
+             {
+                nir_def *idx_parts = nir_unpack_64_2x32(b, index_va);
+                dgc_store(b, nir_channels(b, idx_parts, 0x1),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, four)));
+                dgc_store(b, nir_channels(b, idx_parts, 0x2),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, five)));
+                dgc_store(b, max_idx,
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, six)));
+                dgc_store(b, nir_channels(b, cmd_parts, 0x1),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, seven)));
+                dgc_store(b, nir_channels(b, cmd_parts, 0x2),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, eight)));
+                dgc_store(b, stride,
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, nine)));
+             }
+             nir_pop_if(b, didx_if);
+
+             struct nir_if *dnonidx_if =
+                nir_push_if(b, nir_ieq_imm(b, type,
+                                           VK_INDIRECT_COMMANDS_TOKEN_TYPE_DRAW_EXT));
+             {
+                dgc_store(b, nir_channels(b, cmd_parts, 0x1),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, four)));
+                dgc_store(b, nir_channels(b, cmd_parts, 0x2),
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, five)));
+                dgc_store(b, stride,
+                          dgc_stream_addr(b, stream_va, nir_iadd(b, off, six)));
+             }
+             nir_pop_if(b, dnonidx_if);
+          }
+          nir_pop_if(b, dif);
+
+          /* Смещение в стриме: dwords токена = 1+n (PC), 2 (SI),
+           * 7 (DRAW), 10 (DRAW_INDEXED) — согласовано с dwords_per_seq
+           * в дескрипторе. */
+          /* dgc_sel(m, a, b) = (m == 0) ? a : b: для DRAW (is_si == 0) —
+           * draw_dw, для SI — two. */
+          nir_def *draw_dw = dgc_sel(b, is_draw_idx, seven, ten);
+          nir_def *dw =
+             dgc_sel(b, is_pc,
+                     dgc_sel(b, is_si, draw_dw, two),
+                     nir_iadd(b, one, nir_ushr(b, size, nir_imm_int(b, 2))));
+          nir_store_reg(b, nir_iadd(b, off, dw), reg_off);
+          nir_store_reg(b, nir_iadd(b, t, one), reg_t);
+       }
+       nir_pop_loop(b, tok_loop);
+
+       nir_store_reg(b, nir_iadd(b, i, one), reg_i);
+    }
+    nir_pop_loop(b, seq_loop);
+
+   struct tu_shader_key key = {};
+   struct ir3_shader_key ir3_key = {};
+   struct tu_shader_info info = {};
+   /* NIR-reg -> SSA-phi: IR3 не знает load/store nir_var_shader_temp
+    * (UNREACHABLE в emit_intrinsic), но понимает phi (OPC_META_PHI). */
+   nir_lower_reg_intrinsics_to_ssa(_b.shader);
+   tu_lower_nir(dev, _b.shader, &key, &ir3_key, &info);
+
+   dgc_preprocess_layout.push_constant_size = 20 * sizeof(uint32_t);
+
+   struct tu_shader *shader = NULL;
+   VkResult result =
+      tu_shader_create(dev, &shader, _b.shader, &key, &info, &ir3_key,
+                       "dgc-preprocess-cs", 27, &dgc_preprocess_layout, false);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (getenv("DGC_DUMP")) {
+      const struct tu_push_constant_range *pc = &shader->const_state.push_consts;
+      fprintf(stderr,
+              "preprocess_shader: push_consts type=%d lo=%u dwords=%u\n",
+              (int)pc->type, pc->lo_dwords, pc->dwords);
+   }
+
+   dev->dgc_preprocess_shader = shader;
+   return VK_SUCCESS;
+}
+
+/* Emit диспатча preprocess-шейдера (1x1x1, 1 группа) в указанный стрим.
+ * Аналог пролога tu_dispatch, но со своим shader и в чужой cs. */
+template <chip CHIP>
+static void
+tu_dgc_emit_preprocess_dispatch(struct tu_cmd_buffer *cmd,
+                                struct tu_cs *cs,
+                                struct tu_shader *shader)
+{
+   /* Pend'ящие clean-биты активного кэша — в этот же стрим (как
+    * prologue ту_dispatch через tu_emit_cache_flush). */
+   struct tu_cache_state *cache =
+      cmd->state.pass ? &cmd->state.renderpass_cache : &cmd->state.cache;
+   tu_clean_all_pending(cache);
+   tu6_emit_flushes<CHIP>(cmd, cs, cache);
+
+   struct tu_dispatch_info info = {
+      .blocks = {1, 1, 1},
+   };
+
+   tu_cs_emit_state_ib(cs, shader->state);
+   tu_cs_emit_state_ib(cs, tu_emit_consts<CHIP>(cmd, true));
+   tu_emit_compute_driver_params<CHIP>(cmd, cs, &info);
+   tu_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+
+   const uint16_t *local_size = shader->variant->local_size;
+   tu_cs_emit_regs(
+      cs,
+      SP_CS_NDRANGE_0(CHIP, .kerneldim = 3,
+                          .localsizex = local_size[0] - 1,
+                          .localsizey = local_size[1] - 1,
+                          .localsizez = local_size[2] - 1),
+      SP_CS_NDRANGE_1(CHIP, .globalsize_x = local_size[0]),
+      SP_CS_NDRANGE_2(CHIP, .globaloff_x = 0),
+      SP_CS_NDRANGE_3(CHIP, .globalsize_y = local_size[1]),
+      SP_CS_NDRANGE_4(CHIP, .globaloff_y = 0),
+      SP_CS_NDRANGE_5(CHIP, .globalsize_z = local_size[2]),
+      SP_CS_NDRANGE_6(CHIP, .globaloff_z = 0));
+   if (CHIP >= A7XX)
+      tu_cs_emit_regs(
+         cs,
+         SP_CS_NDRANGE_7(CHIP, .localsizex = local_size[0] - 1,
+                             .localsizey = local_size[1] - 1,
+                             .localsizez = local_size[2] - 1));
+
+   tu_cs_emit_pkt7(cs, CP_EXEC_CS, 4);
+   tu_cs_emit(cs, 0x00000000);
+   tu_cs_emit(cs, CP_EXEC_CS_1_NGROUPS_X(1));
+   tu_cs_emit(cs, CP_EXEC_CS_2_NGROUPS_Y(1));
+   tu_cs_emit(cs, CP_EXEC_CS_3_NGROUPS_Z(1));
+}
+
+template <chip CHIP>
+static void
+tu_dgc_execute(struct tu_cmd_buffer *cmd, VkBool32 isPreprocessed,
+               const VkGeneratedCommandsInfoEXT *pInfo)
+{
+   struct tu_device *dev = cmd->device;
+   VK_FROM_HANDLE(tu_indirect_command_layout, layout,
+                  pInfo->indirectCommandsLayout);
+
+   (void)isPreprocessed; /* M2.3: всё делается на Execute. */
+
+   /* M2.3 scope: PC/SI/DRAW/DRAW_INDEXED. Остальные токены (DISPATCH/IB/VB/
+    * IES/RT/«COUNT»-варианты — M2.4+, отказ громкий. */
+   const uint32_t m23_dgc_info =
+      BITFIELD_BIT(MESA_VK_DGC_PC) | BITFIELD_BIT(MESA_VK_DGC_SI) |
+      BITFIELD_BIT(MESA_VK_DGC_DRAW) |
+      BITFIELD_BIT(MESA_VK_DGC_DRAW_INDEXED);
+   if ((layout->vk.dgc_info & ~m23_dgc_info) != 0 ||
+       layout->unsupported_tokens != 0 || layout->vk.token_count == 0) {
+      vk_errorf(cmd, VK_ERROR_FEATURE_NOT_PRESENT,
+                "DGC Execute: tokens outside the M2.3 scope "
+                "(dgc_info=0x%x, m2.3=0x%x, unsupported=%u; "
+                "DISPATCH/IB/VB/IES/RT/counts land with M2.4+)",
+                layout->vk.dgc_info, m23_dgc_info,
+                layout->unsupported_tokens);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   /* DRAW и DRAW_INDEXED в одном layout не поддерживаем: initiator/multi1/
+    * multi_hdr — per-layout (одни значения в PC) и не могут описать оба
+    * типа draw одновременно. */
+   if ((layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DRAW)) &&
+       (layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DRAW_INDEXED))) {
+      vk_errorf(cmd, VK_ERROR_FEATURE_NOT_PRESENT,
+                "DGC Execute: mixed DRAW/DRAW_INDEXED tokens are unsupported "
+                "(draw params are shared per layout)");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+
+   /* Активный стрим: RP -> draw_cs, иначе cs. */
+   struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
+   bool in_rp = cs == &cmd->draw_cs;
+
+   const uint32_t stride = layout->vk.stride;
+   const uint32_t dwords_per_seq = layout->dwords_per_seq;
+   uint32_t max_count = pInfo->maxSequenceCount;
+   if (max_count == 0)
+      max_count = (uint32_t)(pInfo->indirectAddressSize / stride);
+   if (max_count == 0)
+      max_count = 1;
+
+   /* Stream BO: max_count последовательностей, предзаполнен CP_NOP
+    * (хвост за последним реальным пакетом не исполняется, но должен быть
+    * валидным PM4 на случай prefetch'а). */
+   const uint64_t stream_size64 =
+      (uint64_t)max_count * dwords_per_seq * sizeof(uint32_t);
+   if (stream_size64 > (512u << 20) || dwords_per_seq == 0) {
+      vk_errorf(cmd, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                "DGC Execute: stream too large (%llu bytes)",
+                (unsigned long long)stream_size64);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   const uint32_t stream_size = (uint32_t)stream_size64;
+   struct tu_bo *stream_bo;
+   if (tu_bo_init_new(dev, NULL, &stream_bo, stream_size, TU_BO_ALLOC_NO_FLAGS,
+                      "dgc stream") != VK_SUCCESS) {
+      vk_errorf(cmd, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                "DGC Execute: stream BO allocation failed");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   if (tu_bo_map(dev, stream_bo, NULL) != VK_SUCCESS) {
+      tu_bo_finish(dev, stream_bo);
+      vk_errorf(cmd, VK_ERROR_OUT_OF_HOST_MEMORY,
+                "DGC Execute: stream BO map failed");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   {
+      const uint32_t nop = pm4_pkt7_hdr(CP_NOP, 0);
+      uint32_t *map = (uint32_t *)stream_bo->map;
+      for (uint32_t n = 0; n < stream_size / sizeof(uint32_t); n++)
+         map[n] = nop;
+   }
+   (void)tu_bo_unmap(dev, stream_bo, false);
+   util_dynarray_append(&cmd->dgc_stream_bos, stream_bo);
+   dev->dgc_last_stream_bo = stream_bo;
+   dev->dgc_last_stream_size = stream_size;
+
+   /* Внутренний preprocess-шейдер (лениво, как M2.0). */
+   if (!dev->dgc_preprocess_shader &&
+       tu_dgc_create_preprocess_shader(dev) != VK_SUCCESS) {
+      vk_errorf(cmd, VK_ERROR_DEVICE_LOST,
+                "DGC Execute: failed to create the preprocess shader");
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_DEVICE_LOST);
+      return;
+   }
+   struct tu_shader *ps = dev->dgc_preprocess_shader;
+   const struct tu_push_constant_range *pcr = &ps->const_state.push_consts;
+   if (pcr->type != IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
+      vk_errorf(cmd, VK_ERROR_DEVICE_LOST,
+                "DGC Execute: preprocess shader PC range is not a shared "
+                "preamble (type=%d)",
+                (int)pcr->type);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_DEVICE_LOST);
+      return;
+   }
+
+   /* PC-токены целятся в PC-диапазон привязанного пайплайна. */
+   bool has_draw =
+      (layout->vk.dgc_info &
+       (BITFIELD_BIT(MESA_VK_DGC_DRAW) |
+        BITFIELD_BIT(MESA_VK_DGC_DRAW_INDEXED))) != 0;
+   uint32_t pc_base = 0;
+   if (layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_PC)) {
+      const struct tu_push_constant_range *bound =
+         has_draw ? &cmd->state.program.shared_consts :
+         (cmd->state.shaders[MESA_SHADER_COMPUTE] ?
+            &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state.push_consts :
+            NULL);
+      if (!bound || bound->type != IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
+         vk_errorf(cmd, VK_ERROR_FEATURE_NOT_PRESENT,
+                   "DGC Execute: bound pipeline PC range is not a shared "
+                   "preamble");
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      pc_base = SP_SHARED_CONSTANT_GFX_REG(CHIP, bound->lo_dwords).reg;
+   }
+
+   /* Параметры draw'а (CPU-сторона, из привязанного состояния). Оба
+    * варианта: шейдер ветвится по типу токена (мешать DRAW/DRAW_INDEXED
+    * в одном layout нельзя — см. валидацию выше). */
+   const bool indexed =
+      (layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DRAW_INDEXED)) != 0;
+   uint32_t initiator_idx = 0, multi1_idx = 0, multi_hdr_idx = 0;
+   uint32_t initiator_nonidx = 0, multi1_nonidx = 0, multi_hdr_nonidx = 0;
+   if (has_draw) {
+      tu6_emit_empty_vs_params<CHIP>(cmd);
+      initiator_idx = tu_draw_initiator(cmd, DI_SRC_SEL_DMA);
+      initiator_nonidx = tu_draw_initiator(cmd, DI_SRC_SEL_AUTO_INDEX);
+      multi1_idx =
+         A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_INDEXED) |
+         A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd));
+      multi1_nonidx =
+         A6XX_CP_DRAW_INDIRECT_MULTI_1_OPCODE(INDIRECT_OP_NORMAL) |
+         A6XX_CP_DRAW_INDIRECT_MULTI_1_DST_OFF(vs_params_offset(cmd));
+      multi_hdr_idx = pm4_pkt7_hdr(CP_DRAW_INDIRECT_MULTI, 9);
+      multi_hdr_nonidx = pm4_pkt7_hdr(CP_DRAW_INDIRECT_MULTI, 6);
+   }
+
+   /* Параметры (19 dword'ов): сохраним push constants приложения,
+    * восстановим после dispatch'а. */
+   const uint32_t pc_off = pcr->lo_dwords;
+   const uint32_t pc_span = MAX2(19, pcr->dwords);
+   if (pc_off + pc_span > MAX_PUSH_CONSTANTS_SIZE / 4) {
+      vk_errorf(cmd, VK_ERROR_DEVICE_LOST,
+                "DGC Execute: preprocess PC range does not fit "
+                "(lo=%u span=%u)",
+                pc_off, pc_span);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_DEVICE_LOST);
+      return;
+   }
+   uint32_t pc_saved[MAX_PUSH_CONSTANTS_SIZE / 4];
+   memcpy(pc_saved, cmd->push_constants + pc_off, pc_span * sizeof(uint32_t));
+
+   uint32_t *pc = cmd->push_constants + pc_off;
+   const uint64_t desc_va = layout->bo->iova;
+   const uint64_t indirect_va = pInfo->indirectAddress;
+   const uint64_t count_va = pInfo->sequenceCountAddress;
+   const uint64_t stream_va = stream_bo->iova;
+   pc[0] = (uint32_t)desc_va;
+   pc[1] = (uint32_t)(desc_va >> 32);
+   pc[2] = (uint32_t)indirect_va;
+   pc[3] = (uint32_t)(indirect_va >> 32);
+   pc[4] = (uint32_t)count_va;
+   pc[5] = (uint32_t)(count_va >> 32);
+   pc[6] = (uint32_t)stream_va;
+   pc[7] = (uint32_t)(stream_va >> 32);
+   pc[8] = max_count;
+   pc[9] = pc_base;
+   /* DRAW_INDEXED: payload 9 dword'ов (index VA + max + cmd-VA + stride). */
+   pc[10] = initiator_idx;
+   pc[11] = multi1_idx;
+   pc[12] = (uint32_t)cmd->state.index_va;
+   pc[13] = (uint32_t)(cmd->state.index_va >> 32);
+   pc[14] = cmd->state.max_index_count;
+   pc[15] = multi_hdr_idx;
+   /* DRAW: payload 6 dword'ов (cmd-VA + stride, index-полей нет). */
+   pc[16] = multi_hdr_nonidx;
+   pc[17] = initiator_nonidx;
+   pc[18] = multi1_nonidx;
+
+   if (getenv("DGC_DUMP")) {
+      fprintf(stderr,
+              "dgc_exec: layout=%p tokens=%u stride=%u dws/seq=%u max=%u "
+              "stream=%u pc_base=%#x initiator_idx=%#x multi1_idx=%#x "
+              "hdr_idx=%#x hdr_nonidx=%#x "
+              "desc_va=%#llx indirect_va=%#llx count_va=%#llx "
+              "stream_va=%#llx idx_va=%#llx max_idx=%u\n",
+              (void *)layout, layout->vk.token_count, stride,
+              dwords_per_seq, max_count, stream_size, pc_base, initiator_idx,
+              multi1_idx, multi_hdr_idx, multi_hdr_nonidx,
+              (unsigned long long)desc_va,
+              (unsigned long long)indirect_va,
+              (unsigned long long)count_va, (unsigned long long)stream_va,
+              (unsigned long long)cmd->state.index_va,
+              cmd->state.max_index_count);
+   }
+
+   /* Dispatch: save/restore CS-состояния приложения (мой kernel живёт
+    * только в пределах emit'а). */
+   struct tu_shader *saved_cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
+   const uint32_t saved_dirty = cmd->state.dirty;
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = ps;
+   cmd->state.compute_load_state = (struct tu_draw_state) {};
+   cmd->state.dirty &= ~TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+   tu_dgc_emit_preprocess_dispatch<CHIP>(cmd, cs, ps);
+
+   /* Барьер M2.0: CLEAN -> WFI -> WFM (замеры: минимум для FRESH). */
+   {
+      const unsigned flush =
+         TU_CMD_FLAG_CACHE_CLEAN | TU_CMD_FLAG_WAIT_FOR_IDLE |
+         TU_CMD_FLAG_WAIT_FOR_ME;
+      struct tu_cache_state *cache =
+         in_rp ? &cmd->state.renderpass_cache : &cmd->state.cache;
+      cache->flush_bits |= flush;
+      tu6_emit_flushes<CHIP>(cmd, cs, cache);
+   }
+
+   /* Restore состояний приложения. PC — до выдачи draw-состояний:
+    * tu_emit_consts внутри tu6_draw_common копирует cmd->push_constants
+    * в graphics-preamble в момент вызова. */
+   cmd->state.shaders[MESA_SHADER_COMPUTE] = saved_cs;
+   memcpy(cmd->push_constants + pc_off, pc_saved,
+          pc_span * sizeof(uint32_t));
+
+   /* Форс-выдать все pending draw-состояния приложения (VB/VS/DESC_SETS/
+    * consts/dynamic): DRAW-пакет в стриме исполняет draw приложения, а
+    * в turnip draw-состояния эмитятся в момент draw через dirty-биты —
+    * без этого VS читает VBO по мусорному адресу (TRANSLATION fault).
+    * Штатный путь draw-entry (draw_count=0 — count идёт из стрима, как в
+    * indirect); vs_params (пустые, из tu6_emit_empty_vs_params) выдаёт
+    * тот же путь. */
+   if (has_draw)
+      tu6_draw_common<CHIP>(cmd, cs, indexed, 0);
+
+   /* После tu6_draw_common graphics-dirty-биты законно очищены (состояния
+    * реально выданы) — не восстанавливаем их, иначе следующий draw
+    * приложения перепечатает всё вторым разом. Возвращаем только
+    * compute-бит, снятый временно для нашего dispatch'а. */
+   cmd->state.dirty |= saved_dirty & TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+
+   /* IB на сгенерированный стрим. */
+   {
+      struct tu_cs_entry entry = {
+         .bo = stream_bo,
+         .size = stream_size,
+         .offset = 0,
+      };
+      tu_cs_emit_ib(cs, &entry);
+   }
+
+   /* DGC-диагностика: дамп всего активного стрима (внутри RP это
+    * draw_cs — его entry'сы потом discard'ятся, так что ловим здесь). */
+   if (getenv("DGC_DUMP")) {
+      for (uint32_t e = 0; e < cs->entry_count; e++) {
+         const struct tu_cs_entry *en = &cs->entries[e];
+         fprintf(stderr,
+                 "dgc_exec_cs: %s entry[%u] iova=%#llx off=%u size=%u\n",
+                 in_rp ? "draw_cs" : "cs", e,
+                 (unsigned long long)en->bo->iova, en->offset,
+                 (unsigned)en->size);
+         if (en->bo->map) {
+            const uint32_t *p = (const uint32_t *)en->bo->map +
+               (en->offset / sizeof(uint32_t));
+            uint32_t n = en->size / sizeof(uint32_t);
+            for (uint32_t w = 0; w < n && w < 400; w++)
+               fprintf(stderr, "  %04x: %08x\n", w, p[w]);
+         }
+      }
+      if (!tu_cs_is_empty(cs)) {
+         const struct tu_bo *cur_bo = cs->writeable ?
+            cs->read_write.bos[cs->read_write.bo_count - 1] :
+            cs->read_only.bos[cs->read_only.bo_count - 1];
+         const uint32_t *p = (const uint32_t *)cs->start;
+         uint32_t n = (uint32_t)((uintptr_t)cs->cur - (uintptr_t)cs->start) /
+            sizeof(uint32_t);
+         fprintf(stderr,
+                 "dgc_exec_cs: %s active iova=%#llx n=%u\n",
+                 in_rp ? "draw_cs" : "cs",
+                 (unsigned long long)cur_bo->iova, n);
+         for (uint32_t w = 0; w < n && w < 400; w++)
+            fprintf(stderr, "  %04x: %08x\n", w, p[w]);
+      }
+   }
+}
+
+void
+tu_dgc_execute_generated_commands(struct tu_cmd_buffer *cmd,
+                                  VkBool32 isPreprocessed,
+                                  const VkGeneratedCommandsInfoEXT *pInfo)
+{
+   TU_CALLX(cmd->device, tu_dgc_execute)(cmd, isPreprocessed, pInfo);
+}
+TU_GENX(tu_dgc_execute);
 
 /* ---------------- DGC M2.0 spike: внутренний probe-шейдер ----------------
  *

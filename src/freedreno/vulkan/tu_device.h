@@ -393,6 +393,16 @@ struct tu_device
     * видит устаревшее». */
    struct tu_shader *dgc_probe_verify_shader;
 
+   /* DGC M2.3: preprocess-шейдер (1x1x1): читает layout-дескриптор и
+    * последовательности, генерирует PM4-стрим (PKT4-записи PC +
+    * CP_DRAW_INDIRECT_MULTI). Создаётся лениво на первом Execute. */
+   struct tu_shader *dgc_preprocess_shader;
+
+   /* DGC debug: последний сгенерированный stream-BO (удерживается
+    * записавшим его command buffer); vkCmdTuDgcDumpStreamEXT. */
+   struct tu_bo *dgc_last_stream_bo;
+   uint32_t dgc_last_stream_size;
+
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
    BITSET_DECLARE(custom_border_color, TU_BORDER_COLOR_COUNT);
