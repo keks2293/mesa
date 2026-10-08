@@ -97,6 +97,102 @@ tu6_mutable_format_list_ubwc_compatible(const struct fd_dev_info *info,
    return true;
 }
 
+static bool
+tu_is_r8g8(enum pipe_format format)
+{
+   return (util_format_get_blocksize(format) == 2) &&
+          (util_format_get_nr_components(format) == 2);
+}
+
+static bool
+tu_is_r8g8_compatible(enum pipe_format format)
+{
+   return (util_format_get_blocksize(format) == 2) &&
+          !util_format_is_depth_or_stencil(format);
+}
+
+bool
+tu6_format_list_has_swaps(const VkImageFormatListCreateInfo *fmt_list)
+{
+   /* If there's no format list, then the app may reinterpret to any compatible
+    * format, and presumably one would have the swap set.
+    */
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return true;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      enum pipe_format format =
+         vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
+
+      if (tu6_format_texture(format, TILE6_LINEAR, false).swap)
+         return true;
+   }
+   return false;
+}
+
+/* R8G8 have a different block width/height and height alignment from other
+ * formats that would normally be compatible (like R16), and so if we are
+ * trying to, for example, sample R16 as R8G8 we need to demote to linear.
+ */
+bool
+tu6_format_list_reinterprets_r8g8_r16(
+   enum pipe_format format, const VkImageFormatListCreateInfo *fmt_list)
+{
+   /* Check if it's actually a 2-cpp color format. */
+   if (!tu_is_r8g8_compatible(format))
+      return false;
+
+   /* If there's no format list, then the app may reinterpret to any compatible
+    * format.
+    */
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return true;
+
+   bool has_r8g8 = false;
+   bool has_non_r8g8 = false;
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      enum pipe_format view_format =
+         vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
+      if (tu_is_r8g8(view_format))
+         has_r8g8 = true;
+      else
+         has_non_r8g8 = true;
+   }
+   return has_r8g8 && has_non_r8g8;
+}
+
+bool
+tu6_mutable_format_list_forces_linear(const struct fd_dev_info *info,
+                                      VkFormat format,
+                                      const VkImageFormatListCreateInfo *fmt_list)
+{
+   /* A list we already consider compatible keeps the tiled layout. */
+   if (tu6_mutable_format_list_ubwc_compatible(info, fmt_list))
+      return false;
+
+   /* Depth and stencil images are not mutable as far as we are concerned,
+    * tu_image_init() leaves their layout alone.
+    */
+   if (vk_format_is_depth_or_stencil(format))
+      return false;
+
+   /* NV12 compresses the Y channel in a way that doesn't survive
+    * reinterpretation, it is always linear.
+    */
+   if (format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+      return true;
+
+   /* Parts which claim every format is reinterpretable keep the tiled layout
+    * and flag the descriptor instead, they never take the linear fallback.
+    */
+   if (info->props.ubwc_all_formats_compatible)
+      return false;
+
+   return tu6_format_list_reinterprets_r8g8_r16(
+             vk_format_to_pipe_format(format), fmt_list) ||
+          tu6_format_list_has_swaps(fmt_list);
+}
+
 bool
 tu_format_linear_filtering_supported(struct tu_physical_device *physical_device,
                                      VkFormat vk_format)
@@ -607,6 +703,20 @@ tu_get_image_format_properties(
           !tiling_possible(info->format) ||
           (info->usage & VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT))
          return tu_image_unsupported_format(pImageFormatProperties);
+
+      /* Same for a mutable image whose format list demotes it to linear: the
+       * create is refused (see tu_image_init()), so don't advertise the
+       * combination here either.  A query without a format list cannot know
+       * this, and stays as it is.
+       */
+      if (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+         const VkImageFormatListCreateInfo *format_list =
+            vk_find_struct_const(info->pNext,
+                                 IMAGE_FORMAT_LIST_CREATE_INFO);
+         if (tu6_mutable_format_list_forces_linear(physical_device->info,
+                                                    info->format, format_list))
+            return tu_image_unsupported_format(pImageFormatProperties);
+      }
    }
 
    if (info->type != VK_IMAGE_TYPE_2D &&

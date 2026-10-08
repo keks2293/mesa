@@ -491,8 +491,15 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->shaderInt16 = true;
    features->sparseBinding = pdevice->has_sparse;
    features->sparseResidencyBuffer = pdevice->has_sparse_prr;
-   features->sparseResidencyImage2D = pdevice->has_sparse_prr &&
-      pdevice->info->props.ubwc_all_formats_compatible;
+   /* Sparse residency has nothing to do with UBWC: ubwc_possible() rejects
+    * SPARSE_RESIDENCY unconditionally, because an unbound block may still
+    * hold fast-clear data, so a sparse image is always tiled and never
+    * compressed.  Requiring ubwc_all_formats_compatible here (which is only
+    * claimed for parts whose tiled layout can reinterpret any format at
+    * all) therefore says nothing about sparse support, it only hid the
+    * sparse machinery on the parts which do have it.
+    */
+   features->sparseResidencyImage2D = pdevice->has_sparse_prr;
    features->sparseResidency2Samples = features->sparseResidencyImage2D;
    features->sparseResidency4Samples = features->sparseResidencyImage2D;
    features->sparseResidency8Samples = features->sparseResidencyImage2D;
