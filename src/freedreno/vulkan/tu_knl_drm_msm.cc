@@ -996,11 +996,8 @@ msm_queue_submit(struct tu_queue *queue, void *_submit,
    uint64_t other_timepoint =
       submit->binds.size != 0 ? queue->gfx_timepoint :
       queue->sparse_timepoint;
-   uint32_t extra_wait_count =
-      (queue->type == TU_QUEUE_GFX && other_timepoint != 0) ? 1 : 0;
-   uint32_t extra_signal_count =
-      (queue->type == TU_QUEUE_GFX && has_vm_bind) ? 1 : 0;
-
+   uint32_t extra_wait_count = 0;
+   uint32_t extra_signal_count = 0;
    /* Allocate without wait timeline semaphores */
    in_syncobjs = (struct drm_msm_syncobj *) vk_zalloc(
       &queue->device->vk.alloc,
